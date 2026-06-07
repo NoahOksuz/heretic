@@ -62,7 +62,7 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod
+from .config import DirectionScope, QuantizationMethod
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .reproduce import collect_reproducibles
@@ -549,13 +549,16 @@ def run():
         trial_index += 1
         trial.set_user_attr("index", trial_index)
 
-        direction_scope = trial.suggest_categorical(
-            "direction_scope",
-            [
-                "global",
-                "per layer",
-            ],
-        )
+        if settings.direction_scope == DirectionScope.AUTO:
+            direction_scope = trial.suggest_categorical(
+                "direction_scope",
+                [
+                    "global",
+                    "per layer",
+                ],
+            )
+        else:
+            direction_scope = settings.direction_scope.value
 
         last_layer_index = len(model.get_layers()) - 1
 

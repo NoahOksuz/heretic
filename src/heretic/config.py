@@ -32,6 +32,12 @@ class RowNormalization(str, Enum):
     FULL = "full"
 
 
+class DirectionScope(str, Enum):
+    AUTO = "auto"
+    GLOBAL = "global"
+    PER_LAYER = "per layer"
+
+
 class DatasetSpecification(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
@@ -322,6 +328,16 @@ class Settings(BaseSettings):
             'This can tame so-called "massive activations" that occur in some models. '
             "Example: winsorization_quantile = 0.95 computes the 0.95-quantile of the absolute values "
             "of the components, then clamps the magnitudes of all components to that quantile."
+        ),
+    )
+
+    direction_scope: DirectionScope = Field(
+        default=DirectionScope.AUTO,
+        description=(
+            "How to choose refusal directions during optimization. Options: "
+            '"auto" (search global vs per layer), '
+            '"global" (one interpolated direction for all layers), '
+            '"per layer" (each layer uses its own refusal direction).'
         ),
     )
 

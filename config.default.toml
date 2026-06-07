@@ -117,6 +117,10 @@ full_normalization_lora_rank = 3
 # of the components, then clamps the magnitudes of all components to that quantile.
 winsorization_quantile = 1.0
 
+# How to choose refusal directions during optimization.
+# Options: "auto" (search global vs per layer), "global", "per layer"
+direction_scope = "auto"
+
 # Number of abliteration trials to run during optimization.
 n_trials = 200
 
