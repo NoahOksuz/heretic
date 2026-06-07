@@ -33,7 +33,6 @@ import os
 import random
 import time
 import warnings
-from dataclasses import asdict
 from importlib.metadata import version
 from os.path import commonprefix
 from pathlib import Path
@@ -49,7 +48,6 @@ import torch.nn.functional as F
 import transformers
 from huggingface_hub import ModelCard, ModelCardData
 from lm_eval.models.huggingface import HFLM
-from optuna import Trial, TrialPruned
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
@@ -65,10 +63,20 @@ from .analyzer import Analyzer
 from .config import QuantizationMethod
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
+from .parallel import (
+    OptimizationArtifacts,
+    delete_optimization_artifacts,
+    free_parallel_workers,
+    get_artifact_paths,
+    prep_device_map,
+    reload_model_for_ui,
+    resolve_n_workers,
+    run_parallel_optimize,
+    save_optimization_artifacts,
+)
 from .reproduce import collect_reproducibles
 from .system import empty_cache, get_accelerator_info
 from .utils import (
-    format_duration,
     get_readme_intro,
     get_trial_parameters,
     is_hf_path,
@@ -318,286 +326,20 @@ def run():
             )
         elif choice == "restart":
             os.unlink(study_checkpoint_file)
+            delete_optimization_artifacts(
+                get_artifact_paths(settings.study_checkpoint_dir, settings.model)
+            )
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
             storage = JournalStorage(backend)
         elif choice is None or choice == "":
             return
 
-    model = Model(settings)
-    print()
-    print_memory_usage()
-
-    print()
-    print(f"Loading good prompts from [bold]{settings.good_prompts.dataset}[/]...")
-    good_prompts = load_prompts(settings, settings.good_prompts)
-    print(f"* [bold]{len(good_prompts)}[/] prompts loaded")
-
-    print()
-    print(f"Loading bad prompts from [bold]{settings.bad_prompts.dataset}[/]...")
-    bad_prompts = load_prompts(settings, settings.bad_prompts)
-    print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
-
-    if settings.batch_size == 0:
-        print()
-        print("Determining optimal batch size...")
-
-        batch_size = 1
-        best_batch_size = -1
-        best_performance = -1
-
-        while batch_size <= settings.max_batch_size:
-            print(f"* Trying batch size [bold]{batch_size}[/]... ", end="")
-
-            prompts = good_prompts * math.ceil(batch_size / len(good_prompts))
-            prompts = prompts[:batch_size]
-
-            try:
-                # Warmup run to build the computation graph so that part isn't benchmarked.
-                model.get_responses(prompts)
-
-                start_time = time.perf_counter()
-                responses = model.get_responses(prompts)
-                end_time = time.perf_counter()
-            except Exception as error:
-                if batch_size == 1:
-                    # Even a batch size of 1 already fails.
-                    # We cannot recover from this.
-                    raise
-
-                print(f"[red]Failed[/] ({error})")
-                break
-
-            response_lengths = [
-                len(model.tokenizer.encode(response)) for response in responses
-            ]
-            performance = sum(response_lengths) / (end_time - start_time)
-
-            print(f"[green]Ok[/] ([bold]{performance:.0f}[/] tokens/s)")
-
-            if performance > best_performance:
-                best_batch_size = batch_size
-                best_performance = performance
-
-            batch_size *= 2
-
-        settings.batch_size = best_batch_size
-        print(f"* Chosen batch size: [bold]{settings.batch_size}[/]")
-
-    if settings.response_prefix is None:
-        print()
-        print("Checking for common response prefix...")
-        prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
-        responses = model.get_responses_batched(prefix_check_prompts)
-
-        # Despite being located in os.path, commonprefix actually performs
-        # a naive string operation without any path-specific logic,
-        # which is exactly what we need here. Trailing spaces are removed
-        # to avoid issues where multiple different tokens that all start
-        # with a space character lead to the common prefix ending with
-        # a space, which would result in an uncommon tokenization.
-        settings.response_prefix = commonprefix(responses).rstrip(" ")
-
-        if settings.response_prefix:
-            print(f"* Prefix found: [bold]{settings.response_prefix!r}[/]")
-
-            for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
-                if settings.response_prefix.startswith(cot_initializer):
-                    settings.response_prefix = closed_cot_block
-                    print(
-                        f"* Closed Chain-of-Thought block: [bold]{settings.response_prefix!r}[/]"
-                    )
-
-                    # When using a Chain-of-Thought skip, we need to check that the prefix
-                    # is actually complete (e.g. not missing a trailing newline).
-                    print("* Rechecking with prefix...")
-                    responses = model.get_responses_batched(prefix_check_prompts)
-                    additional_prefix = commonprefix(responses).rstrip(" ")
-                    if additional_prefix:
-                        settings.response_prefix += additional_prefix
-                        print(
-                            f"* Extended prefix found: [bold]{settings.response_prefix!r}[/]"
-                        )
-
-                    break
-        else:
-            print("* None found")
-
-    evaluator = Evaluator(settings, model)
-
-    if settings.evaluate_model is not None:
-        print()
-        print(f"Loading model [bold]{settings.evaluate_model}[/]...")
-        settings.model = settings.evaluate_model
-        model.reset_model()
-        print("* Evaluating...")
-        evaluator.get_score()
-        return
-
-    print()
-    print("Calculating per-layer refusal directions...")
-
-    needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
-
-    if needs_full_residuals:
-        print("* Obtaining residuals for good prompts...")
-        good_residuals = model.get_residuals_batched(good_prompts)
-        print("* Obtaining residuals for bad prompts...")
-        bad_residuals = model.get_residuals_batched(bad_prompts)
-
-        good_means = good_residuals.mean(dim=0)
-        bad_means = bad_residuals.mean(dim=0)
-
-        analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
-
-        if settings.print_residual_geometry:
-            analyzer.print_residual_geometry()
-
-        if settings.plot_residuals:
-            analyzer.plot_residuals()
-
-        # We don't need the full residuals after computing their means and analyzing geometry.
-        del good_residuals, bad_residuals, analyzer
-    else:
-        print("* Obtaining residual mean for good prompts...")
-        good_means = model.get_residuals_mean(good_prompts)
-        print("* Obtaining residual mean for bad prompts...")
-        bad_means = model.get_residuals_mean(bad_prompts)
-
-    refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
-
-    if settings.orthogonalize_direction:
-        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the refusal directions so that only the component that is
-        # orthogonal to the good direction is subtracted during abliteration.
-        good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
-        refusal_directions = (
-            refusal_directions - projection_vector.unsqueeze(1) * good_directions
-        )
-        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
-        del good_directions, projection_vector
-
-    del good_means, bad_means
-
-    # Clear cache before starting the optimization study.
-    # This should free up memory from the objects released with the del statements above.
-    empty_cache()
-
-    trial_index = 0
-    start_index = 0
-    start_time = time.perf_counter()
-
-    def objective(trial: Trial) -> tuple[float, float]:
-        nonlocal trial_index
-        trial_index += 1
-        trial.set_user_attr("index", trial_index)
-
-        direction_scope = trial.suggest_categorical(
-            "direction_scope",
-            [
-                "global",
-                "per layer",
-            ],
-        )
-
-        last_layer_index = len(model.get_layers()) - 1
-
-        # Discrimination between "harmful" and "harmless" inputs is usually strongest
-        # in layers slightly past the midpoint of the layer stack. See the original
-        # abliteration paper (https://arxiv.org/abs/2406.11717) for a deeper analysis.
-        #
-        # Note that we always sample this parameter even though we only need it for
-        # the "global" direction scope. The reason is that multivariate TPE doesn't
-        # work with conditional or variable-range parameters.
-        direction_index = trial.suggest_float(
-            "direction_index",
-            0.4 * last_layer_index,
-            0.9 * last_layer_index,
-        )
-
-        if direction_scope == "per layer":
-            direction_index = None
-
-        parameters = {}
-
-        for component in model.get_abliterable_components():
-            # The parameter ranges are based on experiments with various models
-            # and much wider ranges. They are not set in stone and might have to be
-            # adjusted for future models.
-            max_weight = trial.suggest_float(
-                f"{component}.max_weight",
-                0.8,
-                1.5,
-            )
-            max_weight_position = trial.suggest_float(
-                f"{component}.max_weight_position",
-                0.6 * last_layer_index,
-                1.0 * last_layer_index,
-            )
-            # For sampling purposes, min_weight is expressed as a fraction of max_weight,
-            # again because multivariate TPE doesn't support variable-range parameters.
-            # The value is transformed into the actual min_weight value below.
-            min_weight = trial.suggest_float(
-                f"{component}.min_weight",
-                0.0,
-                1.0,
-            )
-            min_weight_distance = trial.suggest_float(
-                f"{component}.min_weight_distance",
-                1.0,
-                0.6 * last_layer_index,
-            )
-
-            parameters[component] = AbliterationParameters(
-                max_weight=max_weight,
-                max_weight_position=max_weight_position,
-                min_weight=(min_weight * max_weight),
-                min_weight_distance=min_weight_distance,
-            )
-
-        trial.set_user_attr("direction_index", direction_index)
-        trial.set_user_attr("parameters", {k: asdict(v) for k, v in parameters.items()})
-
-        print()
+    n_workers = resolve_n_workers(settings)
+    if n_workers > 1:
+        gpu_ids = list(range(torch.cuda.device_count()))[:n_workers]
         print(
-            f"Running trial [bold]{trial_index}[/] of [bold]{settings.n_trials}[/]..."
+            f"Parallel optimization: [bold]{n_workers}[/] workers on GPUs [bold]{gpu_ids}[/]"
         )
-        print("* Parameters:")
-        for name, value in get_trial_parameters(trial).items():
-            print(f"  * {name} = [bold]{value}[/]")
-        print("* Resetting model...")
-        model.reset_model()
-        print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
-        print("* Evaluating...")
-        score, kl_divergence, refusals = evaluator.get_score()
-
-        elapsed_time = time.perf_counter() - start_time
-        remaining_time = (elapsed_time / (trial_index - start_index)) * (
-            settings.n_trials - trial_index
-        )
-        print()
-        print(f"[grey50]Elapsed time: [bold]{format_duration(elapsed_time)}[/][/]")
-        if trial_index < settings.n_trials:
-            print(
-                f"[grey50]Estimated remaining time: [bold]{format_duration(remaining_time)}[/][/]"
-            )
-        print_memory_usage()
-
-        trial.set_user_attr("kl_divergence", kl_divergence)
-        trial.set_user_attr("refusals", refusals)
-        trial.set_user_attr("base_refusals", evaluator.base_refusals)
-        trial.set_user_attr("n_bad_prompts", len(evaluator.bad_prompts))
-
-        return score
-
-    def objective_wrapper(trial: Trial) -> tuple[float, float]:
-        try:
-            return objective(trial)
-        except KeyboardInterrupt:
-            # Stop the study gracefully on Ctrl+C.
-            trial.study.stop()
-            raise TrialPruned()
 
     study = optuna.create_study(
         sampler=TPESampler(
@@ -613,26 +355,217 @@ def run():
     )
 
     study.set_user_attr("settings", settings.model_dump_json())
-    study.set_user_attr("finished", False)
 
-    start_index = trial_index = len(study.trials)
-    if start_index > 0:
+    artifacts = get_artifact_paths(settings.study_checkpoint_dir, settings.model)
+    prep_skipped = False
+    if settings.evaluate_model is None and "optimization_artifacts" in study.user_attrs:
+        stored_artifacts = OptimizationArtifacts.from_study_attrs(
+            study.user_attrs["optimization_artifacts"]
+        )
+        if stored_artifacts.exists():
+            artifacts = stored_artifacts
+            prep_skipped = True
+            print()
+            print("Using cached optimization artifacts from a previous run.")
+
+    model: Model | None = None
+    evaluator: Evaluator | None = None
+    refusal_directions: torch.Tensor | None = None
+
+    if not prep_skipped:
+        if settings.evaluate_model is None:
+            settings.device_map = prep_device_map()
+        model = Model(settings)
+        print()
+        print_memory_usage()
+
+        print()
+        print(f"Loading good prompts from [bold]{settings.good_prompts.dataset}[/]...")
+        good_prompts = load_prompts(settings, settings.good_prompts)
+        print(f"* [bold]{len(good_prompts)}[/] prompts loaded")
+
+        print()
+        print(f"Loading bad prompts from [bold]{settings.bad_prompts.dataset}[/]...")
+        bad_prompts = load_prompts(settings, settings.bad_prompts)
+        print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
+
+        if settings.batch_size == 0:
+            print()
+            print("Determining optimal batch size...")
+
+            batch_size = 1
+            best_batch_size = -1
+            best_performance = -1
+
+            while batch_size <= settings.max_batch_size:
+                print(f"* Trying batch size [bold]{batch_size}[/]... ", end="")
+
+                prompts = good_prompts * math.ceil(batch_size / len(good_prompts))
+                prompts = prompts[:batch_size]
+
+                try:
+                    # Warmup run to build the computation graph so that part isn't benchmarked.
+                    model.get_responses(prompts)
+
+                    start_time = time.perf_counter()
+                    responses = model.get_responses(prompts)
+                    end_time = time.perf_counter()
+                except Exception as error:
+                    if batch_size == 1:
+                        # Even a batch size of 1 already fails.
+                        # We cannot recover from this.
+                        raise
+
+                    print(f"[red]Failed[/] ({error})")
+                    break
+
+                response_lengths = [
+                    len(model.tokenizer.encode(response)) for response in responses
+                ]
+                performance = sum(response_lengths) / (end_time - start_time)
+
+                print(f"[green]Ok[/] ([bold]{performance:.0f}[/] tokens/s)")
+
+                if performance > best_performance:
+                    best_batch_size = batch_size
+                    best_performance = performance
+
+                batch_size *= 2
+
+            settings.batch_size = best_batch_size
+            print(f"* Chosen batch size: [bold]{settings.batch_size}[/]")
+
+        if settings.response_prefix is None:
+            print()
+            print("Checking for common response prefix...")
+            prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
+            responses = model.get_responses_batched(prefix_check_prompts)
+
+            # Despite being located in os.path, commonprefix actually performs
+            # a naive string operation without any path-specific logic,
+            # which is exactly what we need here. Trailing spaces are removed
+            # to avoid issues where multiple different tokens that all start
+            # with a space character lead to the common prefix ending with
+            # a space, which would result in an uncommon tokenization.
+            settings.response_prefix = commonprefix(responses).rstrip(" ")
+
+            if settings.response_prefix:
+                print(f"* Prefix found: [bold]{settings.response_prefix!r}[/]")
+
+                for cot_initializer, closed_cot_block in settings.chain_of_thought_skips:
+                    if settings.response_prefix.startswith(cot_initializer):
+                        settings.response_prefix = closed_cot_block
+                        print(
+                            f"* Closed Chain-of-Thought block: [bold]{settings.response_prefix!r}[/]"
+                        )
+
+                        # When using a Chain-of-Thought skip, we need to check that the prefix
+                        # is actually complete (e.g. not missing a trailing newline).
+                        print("* Rechecking with prefix...")
+                        responses = model.get_responses_batched(prefix_check_prompts)
+                        additional_prefix = commonprefix(responses).rstrip(" ")
+                        if additional_prefix:
+                            settings.response_prefix += additional_prefix
+                            print(
+                                f"* Extended prefix found: [bold]{settings.response_prefix!r}[/]"
+                            )
+
+                        break
+            else:
+                print("* None found")
+
+        evaluator = Evaluator(settings, model)
+
+        if settings.evaluate_model is not None:
+            print()
+            print(f"Loading model [bold]{settings.evaluate_model}[/]...")
+            settings.model = settings.evaluate_model
+            model.reset_model()
+            print("* Evaluating...")
+            evaluator.get_score()
+            return
+
+        print()
+        print("Calculating per-layer refusal directions...")
+
+        needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
+
+        if needs_full_residuals:
+            print("* Obtaining residuals for good prompts...")
+            good_residuals = model.get_residuals_batched(good_prompts)
+            print("* Obtaining residuals for bad prompts...")
+            bad_residuals = model.get_residuals_batched(bad_prompts)
+
+            good_means = good_residuals.mean(dim=0)
+            bad_means = bad_residuals.mean(dim=0)
+
+            analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
+
+            if settings.print_residual_geometry:
+                analyzer.print_residual_geometry()
+
+            if settings.plot_residuals:
+                analyzer.plot_residuals()
+
+            # We don't need the full residuals after computing their means and analyzing geometry.
+            del good_residuals, bad_residuals, analyzer
+        else:
+            print("* Obtaining residual mean for good prompts...")
+            good_means = model.get_residuals_mean(good_prompts)
+            print("* Obtaining residual mean for bad prompts...")
+            bad_means = model.get_residuals_mean(bad_prompts)
+
+        refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+
+        if settings.orthogonalize_direction:
+            # Implements https://huggingface.co/blog/grimjim/projected-abliteration
+            # Adjust the refusal directions so that only the component that is
+            # orthogonal to the good direction is subtracted during abliteration.
+            good_directions = F.normalize(good_means, p=2, dim=1)
+            projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
+            refusal_directions = (
+                refusal_directions - projection_vector.unsqueeze(1) * good_directions
+            )
+            refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+            del good_directions, projection_vector
+
+        del good_means, bad_means
+
+        save_optimization_artifacts(
+            artifacts,
+            refusal_directions,
+            evaluator.base_logprobs,
+            evaluator.base_refusals,
+        )
+        study.set_user_attr("optimization_artifacts", artifacts.to_study_attrs())
+        study.set_user_attr("settings", settings.model_dump_json())
+
+        del model, evaluator, refusal_directions
+        model = None
+        evaluator = None
+        refusal_directions = None
+        empty_cache()
+
+    study.set_user_attr("finished", False)
+    if "optimize_start_time" not in study.user_attrs:
+        study.set_user_attr("optimize_start_time", time.perf_counter())
+
+    if len(study.trials) > 0:
         print()
         print("Resuming existing study.")
 
-    try:
-        study.optimize(
-            objective_wrapper,
-            n_trials=settings.n_trials - len(study.trials),
-        )
-    except KeyboardInterrupt:
-        # This additional handler takes care of the small chance that KeyboardInterrupt
-        # is raised just between trials, which wouldn't be caught by the handler
-        # defined in objective_wrapper above.
-        pass
+    free_parallel_workers()
+    run_parallel_optimize(
+        study,
+        study_checkpoint_file,
+        settings.n_trials - len(study.trials),
+        n_workers,
+    )
 
     if len(study.trials) == settings.n_trials:
         study.set_user_attr("finished", True)
+
+    model, refusal_directions, evaluator = reload_model_for_ui(settings, artifacts)
 
     while True:
         # If no trials at all have been evaluated, the study must have been stopped
@@ -726,16 +659,21 @@ def run():
                 study.set_user_attr("settings", settings.model_dump_json())
                 study.set_user_attr("finished", False)
 
-                try:
-                    study.optimize(
-                        objective_wrapper,
-                        n_trials=settings.n_trials - len(study.trials),
-                    )
-                except KeyboardInterrupt:
-                    pass
+                del model, evaluator, refusal_directions
+                free_parallel_workers()
+                run_parallel_optimize(
+                    study,
+                    study_checkpoint_file,
+                    settings.n_trials - len(study.trials),
+                    n_workers,
+                )
 
                 if len(study.trials) == settings.n_trials:
                     study.set_user_attr("finished", True)
+
+                model, refusal_directions, evaluator = reload_model_for_ui(
+                    settings, artifacts
+                )
 
                 break
 

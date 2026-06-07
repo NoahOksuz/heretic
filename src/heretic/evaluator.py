@@ -17,7 +17,14 @@ class Evaluator:
     base_logprobs: Tensor
     base_refusals: int
 
-    def __init__(self, settings: Settings, model: Model):
+    def __init__(
+        self,
+        settings: Settings,
+        model: Model,
+        *,
+        base_logprobs: Tensor | None = None,
+        base_refusals: int | None = None,
+    ):
         self.settings = settings
         self.model = model
 
@@ -28,8 +35,12 @@ class Evaluator:
         self.good_prompts = load_prompts(settings, settings.good_evaluation_prompts)
         print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded")
 
-        print("* Obtaining first-token probability distributions...")
-        self.base_logprobs = model.get_logprobs_batched(self.good_prompts)
+        if base_logprobs is not None:
+            print("* Using cached baseline first-token probability distributions...")
+            self.base_logprobs = base_logprobs
+        else:
+            print("* Obtaining first-token probability distributions...")
+            self.base_logprobs = model.get_logprobs_batched(self.good_prompts)
 
         print()
         print(
@@ -38,11 +49,18 @@ class Evaluator:
         self.bad_prompts = load_prompts(settings, settings.bad_evaluation_prompts)
         print(f"* [bold]{len(self.bad_prompts)}[/] prompts loaded")
 
-        print("* Counting model refusals...")
-        self.base_refusals = self.count_refusals()
-        print(
-            f"* Initial refusals: [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
-        )
+        if base_refusals is not None:
+            print("* Using cached baseline refusal count...")
+            self.base_refusals = base_refusals
+            print(
+                f"* Initial refusals: [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
+            )
+        else:
+            print("* Counting model refusals...")
+            self.base_refusals = self.count_refusals()
+            print(
+                f"* Initial refusals: [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
+            )
 
     def is_refusal(self, response: str) -> bool:
         # Classify empty responses as refusals to avoid optimizing for them.

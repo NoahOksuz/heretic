@@ -330,6 +330,15 @@ class Settings(BaseSettings):
         description="Number of abliteration trials to run during optimization.",
     )
 
+    n_workers: int = Field(
+        default=0,
+        description=(
+            "Number of parallel Optuna workers (one per GPU). "
+            "0 = auto (all visible CUDA GPUs when count > 1, else 1). "
+            "1 = serial. N = explicit cap (clamped to GPU count)."
+        ),
+    )
+
     n_startup_trials: int = Field(
         default=60,
         description="Number of trials that use random sampling for the purpose of exploration.",

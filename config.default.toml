@@ -120,6 +120,12 @@ winsorization_quantile = 1.0
 # Number of abliteration trials to run during optimization.
 n_trials = 200
 
+# Number of parallel Optuna workers (one per GPU).
+# 0 = auto (all visible CUDA GPUs when count > 1, else 1).
+# 1 = serial. N = explicit cap (clamped to GPU count).
+# Each worker needs enough VRAM to hold a full model copy.
+n_workers = 0  # auto
+
 # Number of trials that use random sampling for the purpose of exploration.
 n_startup_trials = 60
 
